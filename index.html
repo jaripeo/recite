@@ -1548,6 +1548,10 @@
             if (container._wfTapAttached) return;
             container._wfTapAttached = true;
 
+            // For EPUB spans, ownerDocument is the iframe's document — required for
+            // elementFromPoint and caretRangeFromPoint to use the correct coordinate space.
+            const ownerDoc = container.ownerDocument || document;
+
             let touchMoved  = false;
             let touchStartX = 0;
             let touchStartY = 0;
@@ -1568,21 +1572,71 @@
 
             container.addEventListener('touchend', (e) => {
                 if (touchMoved) return;
-                const target = e.target.closest('.wf-speech-word');
+
+                // ── iOS Safari critical fix ───────────────────────────────────
+                // e.target in touchend is the element at the TOUCH-START point, and
+                // on iOS it is frequently a raw Text node (no .closest() method).
+                // We resolve the word span via three fallbacks in order:
+                //
+                //   1. elementFromPoint(changedTouches[0]) — uses the LIFT coordinates;
+                //      always returns an Element, never a Text node.
+                //   2. e.target element walk — for desktop-style pointer events where
+                //      changedTouches is absent or quantised differently.
+                //   3. caretRangeFromPoint — WebKit caret-position API, navigates from
+                //      text node to its parent element; catches sub-pixel gaps between
+                //      glyph bounding boxes where elementFromPoint returns the body.
+                // ─────────────────────────────────────────────────────────────
+                const touch = e.changedTouches[0];
+                let target  = null;
+
+                // Path 1: hit-test the exact lift point
+                if (touch) {
+                    const el = ownerDoc.elementFromPoint(touch.clientX, touch.clientY);
+                    target = el ? el.closest('.wf-speech-word') : null;
+                }
+
+                // Path 2: walk up from e.target (guards against text-node references)
+                if (!target) {
+                    const t = e.target;
+                    if (t && t.nodeType === Node.ELEMENT_NODE) {
+                        target = t.closest('.wf-speech-word');
+                    } else if (t && t.nodeType === Node.TEXT_NODE && t.parentElement) {
+                        target = t.parentElement.closest('.wf-speech-word');
+                    }
+                }
+
+                // Path 3: caret-range API (WebKit / Blink)
+                if (!target && touch && ownerDoc.caretRangeFromPoint) {
+                    const range = ownerDoc.caretRangeFromPoint(touch.clientX, touch.clientY);
+                    if (range) {
+                        const node = range.startContainer;
+                        const el   = (node.nodeType === Node.TEXT_NODE) ? node.parentElement : node;
+                        target = el ? el.closest('.wf-speech-word') : null;
+                    }
+                }
+
                 if (!target) return;
-                // Suppress the 300 ms synthetic click the browser would fire next
+
+                // Suppress the 300 ms synthetic click that iOS would fire next,
+                // and stop propagation so the document-level epub handler doesn't
+                // double-fire for the same tap.
                 e.preventDefault();
+                e.stopPropagation();
+
                 const start = parseInt(target.dataset.start, 10);
                 if (!isNaN(start)) {
                     cancelCurrentSpeech();
                     appState.globalCharIndex = start;
                     startSpeech();
                 }
-            }, { passive: false }); // passive: false required to call preventDefault
+            }, { passive: false }); // passive: false is required to call preventDefault
 
-            // Desktop / mouse / stylus fallback (suppressed on real touch by above)
+            // Desktop / mouse / stylus fallback.
+            // On real touch, the touchend's e.preventDefault() suppresses this synthetic click.
             container.addEventListener('click', (e) => {
-                const target = e.target.closest('.wf-speech-word');
+                // Guard: e.target may be a text node on some desktop browsers too
+                const el = e.target;
+                const target = (el && el.closest) ? el.closest('.wf-speech-word') : null;
                 if (!target) return;
                 const start = parseInt(target.dataset.start, 10);
                 if (!isNaN(start)) {
@@ -1627,6 +1681,10 @@
                 const end        = currentIndex + part.length;
                 span.dataset.start = start;
                 span.dataset.end   = end;
+                // iOS Safari tap-target hack: without an onclick attribute (even an
+                // empty one) iOS will not fire tap/click events on non-interactive
+                // elements like <span>, even with cursor:pointer in CSS.
+                span.setAttribute('onclick', 'void(0)');
 
                 dom.renderedTextMode.appendChild(span);
                 appState.wordMap.push({ span, start, end });
@@ -1685,6 +1743,8 @@
                             span.textContent   = token;
                             span.dataset.start = start;
                             span.dataset.end   = end;
+                            // iOS tap-target hack (same as plain-text mode — see note there)
+                            span.setAttribute('onclick', 'void(0)');
 
                             fragment.appendChild(span);
                             appState.wordMap.push({ span, start, end });
@@ -1706,31 +1766,119 @@
             Array.from(body.childNodes).forEach(child => injectWordSpans(child));
             appState.fullText = fullText;
 
-            // Inject highlight + touch CSS into the iframe document
-            const STYLE_ID = 'wf-tts-styles';
-            if (!doc.getElementById(STYLE_ID)) {
-                const style = doc.createElement('style');
-                style.id    = STYLE_ID;
-                style.textContent = `
-                    body { -webkit-user-select: none; user-select: none; }
-                    .wf-speech-word {
-                        cursor: pointer;
-                        border-radius: 3px;
-                        touch-action: manipulation;
-                        -webkit-tap-highlight-color: transparent;
-                    }
-                    .wf-speech-word:active { background: rgba(0,122,255,0.10) !important; }
-                    .active-word    { background-color: #ffeb3b !important; font-weight: bold !important; }
-                    .active-sentence{ background-color: #e3f2fd !important; }
-                `;
-                (doc.head || doc.documentElement).appendChild(style);
+            // Inject highlight + touch CSS into the iframe document.
+            // We always overwrite (not guard with a missing-element check) so that
+            // epub.js stylesheet injections that fire AFTER relocated cannot undo our rules.
+            const STYLE_ID   = 'wf-tts-styles';
+            const existingEl = doc.getElementById(STYLE_ID);
+            const styleEl    = existingEl || doc.createElement('style');
+            styleEl.id        = STYLE_ID;
+            styleEl.textContent = `
+                body {
+                    -webkit-user-select: none;
+                    user-select: none;
+                }
+                .wf-speech-word {
+                    /* cursor:pointer is the primary signal iOS Safari uses to decide
+                       whether an element should receive tap events. */
+                    cursor: pointer !important;
+                    border-radius: 3px;
+                    touch-action: manipulation;
+                    -webkit-tap-highlight-color: transparent;
+                    /* Ensure epub.js reader styles cannot accidentally disable taps
+                       by setting pointer-events:none on a parent or the spans themselves. */
+                    pointer-events: auto !important;
+                }
+                .wf-speech-word:active { background: rgba(0,122,255,0.10) !important; }
+                .active-word     { background-color: #ffeb3b !important; font-weight: bold !important; }
+                .active-sentence { background-color: #e3f2fd !important; }
+            `;
+            if (!existingEl) {
+                (doc.head || doc.documentElement).appendChild(styleEl);
             }
 
-            // Single delegated handler for the whole page — NOT per-span listeners.
+            // Primary: delegated handler on the body (works for desktop + pointer events).
             // attachWordTapHandler() guards against re-attachment with _wfTapAttached,
             // and the delegated handler works correctly for freshly-injected spans
-            // because it resolves targets dynamically via e.target.closest().
+            // because it resolves targets dynamically via elementFromPoint / caretRangeFromPoint.
             attachWordTapHandler(body);
+
+            // Secondary: document-level touchend / click using changedTouches[0] coordinates.
+            //
+            // epub.js sometimes installs its own touch handlers on the iframe body and
+            // calls stopPropagation(), which swallows body-level touchend events before
+            // our delegated handler sees them. Attaching to the iframe's *document* sits
+            // above that layer and receives events that bubbled past the body capture phase.
+            //
+            // We guard with _wfDocTapAttached so we attach only once per iframe document
+            // (the guard survives epub.js page turns when the document object is reused).
+            if (!doc._wfDocTapAttached) {
+                doc._wfDocTapAttached = true;
+
+                // Shared helper: resolve the tapped word span from a coordinate pair.
+                // Uses two strategies to handle iOS's varied hit-test quirks.
+                function wordSpanAtCoords(clientX, clientY) {
+                    // 1. elementFromPoint — always returns an Element, never a Text node
+                    let el = doc.elementFromPoint(clientX, clientY);
+                    let target = el ? el.closest('.wf-speech-word') : null;
+
+                    // 2. caretRangeFromPoint — catches sub-pixel gaps where elementFromPoint
+                    //    returns the containing block rather than the inline span
+                    if (!target && doc.caretRangeFromPoint) {
+                        const range = doc.caretRangeFromPoint(clientX, clientY);
+                        if (range) {
+                            const node = range.startContainer;
+                            el = (node.nodeType === Node.TEXT_NODE) ? node.parentElement : node;
+                            target = el ? el.closest('.wf-speech-word') : null;
+                        }
+                    }
+                    return target;
+                }
+
+                let docTouchMoved  = false;
+                let docTouchStartX = 0;
+                let docTouchStartY = 0;
+
+                doc.addEventListener('touchstart', (e) => {
+                    docTouchStartX = e.touches[0].clientX;
+                    docTouchStartY = e.touches[0].clientY;
+                    docTouchMoved  = false;
+                }, { passive: true });
+
+                doc.addEventListener('touchmove', (e) => {
+                    if (Math.abs(e.touches[0].clientX - docTouchStartX) > 6 ||
+                        Math.abs(e.touches[0].clientY - docTouchStartY) > 6) {
+                        docTouchMoved = true;
+                    }
+                }, { passive: true });
+
+                doc.addEventListener('touchend', (e) => {
+                    if (docTouchMoved) return;
+                    // Use the touch lift-point, not the (potentially stale) e.target
+                    const touch  = e.changedTouches[0];
+                    const target = wordSpanAtCoords(touch.clientX, touch.clientY);
+                    if (!target) return;
+                    e.preventDefault();
+                    const start = parseInt(target.dataset.start, 10);
+                    if (!isNaN(start)) {
+                        cancelCurrentSpeech();
+                        appState.globalCharIndex = start;
+                        startSpeech();
+                    }
+                }, { passive: false });
+
+                // Mouse / stylus fallback for the iframe document (desktop EPUB reading)
+                doc.addEventListener('click', (e) => {
+                    const target = wordSpanAtCoords(e.clientX, e.clientY);
+                    if (!target) return;
+                    const start = parseInt(target.dataset.start, 10);
+                    if (!isNaN(start)) {
+                        cancelCurrentSpeech();
+                        appState.globalCharIndex = start;
+                        startSpeech();
+                    }
+                });
+            }
 
             updateStats();
             updateProgress();
