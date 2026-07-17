@@ -339,7 +339,7 @@ function createPlaybackChunks(text, startIndex = 0) {
     const textToChunk = text.substring(startIndex);
     if (!textToChunk.trim()) return [];
 
-    const chunks    = [];
+    const chunks     = [];
     const sentenceRx = /[^.!?]*[.!?]+\s*|[^.!?]+$/g;
     let match;
 
@@ -457,10 +457,10 @@ function resumeSpeech() {
 }
 
 /**
- * finishPageReading — called when TTS exhausts all chunks on an EPUB page.
- * Unlike stopSpeech/cancelCurrentSpeech, this does NOT clear highlights and
- * does NOT reset globalCharIndex. The user can see exactly where audio stopped
- * before manually turning the page with the ❯ button.
+ * finishPageReading — called when TTS exhausts all visible-page chunks.
+ * Stops speech cleanly WITHOUT clearing highlights or resetting globalCharIndex,
+ * so the user sees exactly where audio ended before they press ❯.
+ * Never calls epubRendition.next() — page turn is always manual.
  */
 function finishPageReading() {
     clearTimeout(appState.voiceStartTimeout);
@@ -472,17 +472,16 @@ function finishPageReading() {
     appState.activeUtterance   = null;
     appState.playbackChunks    = [];
     appState.currentChunkIndex = 0;
-    // Intentionally skip clearHighlights() — last word stays highlighted so
-    // the user knows where audio stopped before they turn the page.
-    // Intentionally skip globalCharIndex reset — preserved for context.
+    // Intentionally omit clearHighlights() — last word stays highlighted.
+    // Intentionally omit globalCharIndex reset — position is preserved.
     updatePlaybackUI();
     setStatus("Page done — press ❯ Next to continue");
 }
 
 /**
  * speakChunk — speaks one chunk. When all chunks are exhausted:
- *   • EPUB mode  → finishPageReading() (graceful stop, NO auto page-turn)
- *   • Plain text → stopSpeech() (reset to beginning)
+ *   • EPUB mode  → finishPageReading() (graceful stop, no auto page-turn)
+ *   • Plain text → stopSpeech() (reset to beginning for next play)
  */
 function speakChunk() {
     if (appState.currentChunkIndex >= appState.playbackChunks.length) {
@@ -611,7 +610,7 @@ async function loadEpubWithEpubJs(arrayBuffer) {
 
             appState.epubRendition = appState.epubBook.renderTo(dom.epubMode, {
                 width: '100%', height: '100%',
-                flow: 'paginated', spread: 'auto', allowScriptedContent: false
+                flow: 'paginated', spread: 'none', allowScriptedContent: false
             });
 
             appState.epubRendition.hooks.content.register((contents) => {
@@ -1012,17 +1011,22 @@ function renderPlainTextForReading() {
 }
 
 /**
- * syncVisibleEpubText — optimized with a clone-process-swap pattern:
+ * syncVisibleEpubText — rebuilds the word map for the currently-displayed
+ * EPUB page. Uses a clone-process-swap pattern for performance, then
+ * applies a viewport-visibility filter to restrict TTS and highlighting
+ * to only the words actually visible on screen.
  *
- *  1. Clone the live body (off-screen → zero layout invalidations during processing)
- *  2. Unwrap existing .wf-speech-word spans on the clone
- *  3. Collect text nodes via the native TreeWalker C++ iterator
- *  4. Inject new word spans on the clone (all mutations are off-screen)
- *  5. Swap the processed clone into the live body in 2 DOM mutations
- *
- * Wrapped in requestAnimationFrame so epub.js's page-turn visual is painted
- * before any processing starts — the page appears instantly; spans follow
- * in the next frame.
+ * Why the visibility filter is critical:
+ *   epub.js paginated mode lays the full chapter out as horizontal CSS
+ *   columns inside the iframe. The "current page" is the column whose
+ *   bounding rect falls inside [0, 0, innerWidth, innerHeight] in the
+ *   iframe's coordinate space. Without filtering, the word map would
+ *   contain text from adjacent (off-screen) columns. When TTS highlights
+ *   a word in an off-screen column, scrollIntoView (or even just class
+ *   assignment) can force that column into view, shearing the layout into
+ *   a broken split-screen. By restricting fullText and wordMap to
+ *   visible-column spans only, TTS naturally stops at the page boundary
+ *   and can never reference a hidden span.
  */
 function syncVisibleEpubText() {
     if (!appState.epubRendition) return;
@@ -1031,7 +1035,7 @@ function syncVisibleEpubText() {
     if (!contents || !contents.document) return;
 
     hideWordPopover();
-    cancelCurrentSpeech();   // safe to call on idle engine; clears stale highlights
+    cancelCurrentSpeech();   // safe on idle engine; clears any stale highlights
     appState.globalCharIndex = 0;
     setStatus("Loading page…");
 
@@ -1039,32 +1043,28 @@ function syncVisibleEpubText() {
     const body = doc.body;
     if (!body) return;
 
+    // Defer heavy DOM work one frame so epub.js's page-turn paint completes
+    // first — the column transform is applied synchronously before 'relocated'
+    // fires, so by the time the rAF callback runs the layout is stable and
+    // getBoundingClientRect() returns valid viewport-relative coordinates.
     requestAnimationFrame(() => {
 
         // ── Phase 1: Off-screen clone ─────────────────────────────────────
-        // cloneNode creates a detached copy — mutations on it cause zero
-        // live-document reflows or style recalculations.
         const clone = body.cloneNode(true);
 
-        // ── Phase 2: Unwrap old spans on the clone ────────────────────────
-        // epub.js paginated mode (CSS columns) reuses the same iframe document
-        // across page turns. Spans injected on a prior pass survive in the DOM
-        // and must be removed before re-walking.
+        // ── Phase 2: Unwrap existing spans in the clone ───────────────────
         clone.querySelectorAll('.wf-speech-word').forEach(span => {
             span.replaceWith(doc.createTextNode(span.textContent));
         });
         clone.normalize();
 
         // ── Phase 3: Collect text nodes via native TreeWalker ─────────────
-        // TreeWalker is a C++ iterator — substantially faster than recursive JS
-        // for large EPUB chapters. We snapshot into an array before mutating.
         const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG']);
         const walker    = doc.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
         const textNodes = [];
         let walkerNode;
 
         while ((walkerNode = walker.nextNode()) !== null) {
-            // Reject text inside script/style/svg ancestors
             let el   = walkerNode.parentElement;
             let skip = false;
             while (el) {
@@ -1074,7 +1074,7 @@ function syncVisibleEpubText() {
             if (!skip) textNodes.push(walkerNode);
         }
 
-        // ── Phase 4: Build word spans on the clone (all off-screen) ───────
+        // ── Phase 4: Inject word spans on the clone (all off-screen) ──────
         let fullText = '';
         const wordMap = [];
 
@@ -1110,22 +1110,79 @@ function syncVisibleEpubText() {
         });
 
         // ── Phase 5: Single atomic swap into the live body ────────────────
-        // Move all processed nodes from the detached clone into a fragment,
-        // then replace the live body's children in exactly 2 DOM mutations
-        // (clear + fill) instead of N individual replaceChild calls.
-        // After appendChild(tempFrag), the span refs in wordMap are live
-        // in body because nodes were *moved*, not copied.
         const tempFrag = doc.createDocumentFragment();
         while (clone.firstChild) tempFrag.appendChild(clone.firstChild);
-        body.textContent = '';       // atomic clear  — 1 mutation
-        body.appendChild(tempFrag); // atomic fill   — 1 mutation
+        body.textContent = '';
+        body.appendChild(tempFrag);
+        // Span refs in wordMap are now live in body (nodes were moved, not copied).
 
-        appState.wordMap  = wordMap;
-        appState.fullText = fullText;
+        // ── Phase 6: Viewport-visibility filter ───────────────────────────
+        //
+        // epub.js paginated layout: the visible "page" occupies the iframe
+        // viewport rectangle [0, 0, innerWidth, innerHeight]. Spans in the
+        // next/previous column have rect.left ≥ innerWidth or rect.left < 0.
+        //
+        // We batch all getBoundingClientRect() reads in one pass (one layout
+        // recalculation, then all answers returned from cache) then process
+        // the results without any further DOM reads — avoiding extra reflows.
+        //
+        // Center-based horizontal test: robust against sub-pixel overflow at
+        // column boundaries where a word's box might straddle the edge.
+        const iw = (doc.defaultView && doc.defaultView.innerWidth)  || body.clientWidth  || Infinity;
+        const ih = (doc.defaultView && doc.defaultView.innerHeight) || body.clientHeight || Infinity;
 
-        // ── Inject/refresh iframe CSS ─────────────────────────────────────
-        // Always overwrite (not guard) so epub.js stylesheet injections that
-        // fire after 'relocated' cannot undo our rules.
+        // Single batched read — forces one layout pass, then the browser
+        // answers all subsequent rect queries from its cached layout state.
+        const rects = wordMap.map(entry => entry.span.getBoundingClientRect());
+
+        let firstVis = -1;
+        let lastVis  = -1;
+
+        rects.forEach((rect, i) => {
+            // Skip zero-area rects (hidden elements, collapsed inline nodes)
+            if (rect.width === 0 && rect.height === 0) return;
+            const cx = (rect.left + rect.right)  / 2;
+            const cy = (rect.top  + rect.bottom) / 2;
+            if (cx >= 0 && cx < iw && cy >= 0 && cy < ih) {
+                if (firstVis === -1) firstVis = i;
+                lastVis = i;
+            }
+        });
+
+        // Build the visible-page subset of fullText and wordMap.
+        // visCharStart/End define the character range of the visible page
+        // within the full chapter text string.
+        const visCharStart = firstVis >= 0 ? wordMap[firstVis].start : 0;
+        const visCharEnd   = lastVis  >= 0 ? wordMap[lastVis].end   : fullText.length;
+
+        // Visible text is the exact substring: first-visible-word to
+        // last-visible-word, preserving all inter-word whitespace.
+        const visibleText = fullText.substring(visCharStart, visCharEnd);
+
+        // Remap each visible span's data-start/data-end to be 0-relative
+        // within visibleText. This keeps onboundary charIndex arithmetic
+        // correct and ensures the "Start from here" popover passes a valid
+        // index into the text that TTS will actually read.
+        const visibleWordMap = [];
+        if (firstVis >= 0) {
+            for (let i = firstVis; i <= lastVis; i++) {
+                const entry    = wordMap[i];
+                const newStart = entry.start - visCharStart;
+                const newEnd   = entry.end   - visCharStart;
+                entry.span.dataset.start = newStart;
+                entry.span.dataset.end   = newEnd;
+                visibleWordMap.push({ span: entry.span, start: newStart, end: newEnd });
+            }
+        }
+
+        // Commit: TTS and highlighting now operate exclusively on the
+        // visible page. Off-screen spans remain in the DOM untouched
+        // (epub.js needs them for column layout) but are unreachable
+        // by any TTS or highlight code path.
+        appState.wordMap  = visibleWordMap;
+        appState.fullText = visibleText;
+
+        // ── Phase 7: Inject/refresh iframe CSS ────────────────────────────
         const STYLE_ID   = 'wf-tts-styles';
         const existingEl = doc.getElementById(STYLE_ID);
         const styleEl    = existingEl || doc.createElement('style');
@@ -1145,14 +1202,9 @@ function syncVisibleEpubText() {
         `;
         if (!existingEl) (doc.head || doc.documentElement).appendChild(styleEl);
 
-        // ── Attach delegated touch/click handlers ─────────────────────────
-        // attachWordTapHandler guards against re-attachment with _wfTapAttached.
-        // The delegated handler resolves targets dynamically, so it works for
-        // freshly-injected spans without needing to be reattached each turn.
+        // ── Phase 8: Attach delegated touch/click handlers ────────────────
         attachWordTapHandler(body);
 
-        // Document-level fallback (covers cases where epub.js stopPropagation
-        // swallows body-level touchend events). Attached once per iframe document.
         if (!doc._wfDocTapAttached) {
             doc._wfDocTapAttached = true;
 
@@ -1226,6 +1278,13 @@ function clearHighlights() {
     }
 }
 
+/**
+ * syncHighlights — applies .active-word to the span matching the current
+ * char position. scrollIntoView is intentionally skipped in EPUB mode:
+ * epub.js owns the scroll/transform position and calling scrollIntoView
+ * on any span — even a visible one — can corrupt the column layout by
+ * fighting with epub.js's own scroll management.
+ */
 function syncHighlights() {
     requestAnimationFrame(() => {
         clearHighlights();
@@ -1233,7 +1292,10 @@ function syncHighlights() {
         const active = appState.wordMap.find(w => idx >= w.start && idx < w.end);
         if (active) {
             active.span.classList.add('active-word');
-            active.span.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            // Only scroll in plain-text mode; epub.js manages its own viewport.
+            if (!appState.isEpubActive) {
+                active.span.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
         }
     });
 }
@@ -1293,6 +1355,9 @@ setupSheetDrag(dom.tocHandle,      dom.tocSheet);
 dom.menuBtn.addEventListener('click', () => openSheet(dom.tocSheet));
 dom.settingsToggleBtn.addEventListener('click', () => openSheet(dom.settingsSheet));
 
+// Play toggle: idle → start from top of current page (globalCharIndex = 0
+// after every page turn), speaking → pause, paused → resume.
+// "Start from here" popover overrides globalCharIndex via pendingStartIndex.
 dom.playToggleBtn.addEventListener('click', () => {
     hideWordPopover();
     if (appState.playbackState === 'speaking') { pauseSpeech(); return; }
@@ -1300,6 +1365,8 @@ dom.playToggleBtn.addEventListener('click', () => {
     if (!appState.isEpubActive && dom.plainTextMode.value.trim() !== '') {
         renderPlainTextForReading();
     }
+    // In EPUB mode globalCharIndex is always 0 after a page turn, so Play
+    // naturally starts from the top of the current visible page.
     const idx = (appState.pendingStartIndex !== null) ? appState.pendingStartIndex : appState.globalCharIndex;
     appState.pendingStartIndex = null;
     beginPlaybackFromIndex(idx);
