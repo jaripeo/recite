@@ -533,6 +533,45 @@
         }
         .active-sentence { background-color: var(--highlight-sent); }
 
+        /* ── Floating "Start from here" popover ──────────────────────────────── */
+        .word-popover {
+            position: fixed;
+            /* Above reader content and page-turn buttons; below open sheets is fine
+               because we dismiss the popover whenever a sheet opens. */
+            z-index: 500;
+            top: 0;
+            left: 0;
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            padding: 9px 15px;
+            background: var(--accent);
+            color: #fff;
+            border-radius: 22px;
+            font-size: 14px;
+            font-weight: 600;
+            letter-spacing: -0.2px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.28);
+            cursor: pointer;
+            white-space: nowrap;
+            -webkit-user-select: none;
+            user-select: none;
+            touch-action: manipulation;
+            /* Hidden/animated-out state */
+            opacity: 0;
+            transform: scale(0.86);
+            transform-origin: center bottom;
+            transition: opacity 0.14s ease, transform 0.14s cubic-bezier(0.32, 0.72, 0, 1);
+            pointer-events: none;
+        }
+        .word-popover.visible {
+            opacity: 1;
+            transform: scale(1);
+            pointer-events: auto;
+        }
+        .word-popover:active { background: var(--accent-dark); }
+        .word-popover .wp-icon { font-size: 12px; line-height: 1; }
+
         /* ── Utilities ───────────────────────────────────────────────────────── */
         .hidden    { display: none !important; }
         .sr-only   {
@@ -771,6 +810,17 @@
     <!-- ── Sheet Overlay ───────────────────────────────────────────────────── -->
     <div id="sheetOverlay"></div>
 
+    <!-- ── Floating "Start from here" popover ──────────────────────────────────
+         Anchored to a tapped word. Lives in the MAIN document (never inside the
+         EPUB iframe) so it renders above everything and its tap is a clean,
+         dedicated user gesture for starting speech on iOS.
+    -->
+    <div id="wordPopover" class="word-popover hidden" role="button" tabindex="0"
+         aria-label="Start reading from here">
+        <span class="wp-icon">▶</span>
+        <span class="wp-text">Start from here</span>
+    </div>
+
     <!-- ════════════════════════════════════════════════════════════════════════
          APPLICATION JAVASCRIPT
          All engine logic from speechify.html is preserved intact.
@@ -825,7 +875,9 @@
             tocHandle:          document.getElementById('tocHandle'),
             tocContainer:       document.getElementById('tocContainer'),
             // Overlay
-            sheetOverlay:       document.getElementById('sheetOverlay')
+            sheetOverlay:       document.getElementById('sheetOverlay'),
+            // Floating "Start from here" popover
+            wordPopover:        document.getElementById('wordPopover')
         };
 
         // ── Central State ─────────────────────────────────────────────────────
@@ -844,7 +896,8 @@
             activeRequestId:   0,
             playbackChunks:    [],       // { text, offsetInFull }[]
             currentChunkIndex: 0,
-            voiceStartTimeout: null      // stored in state so cancelCurrentSpeech can clear it
+            voiceStartTimeout: null,     // stored in state so cancelCurrentSpeech can clear it
+            pendingStartIndex: null      // char index the "Start from here" popover will play from
         };
 
         // ── Storage Helpers ───────────────────────────────────────────────────
@@ -1222,7 +1275,16 @@
                 clearHighlights();
                 updatePlaybackUI();
                 // wake lock will be re-acquired inside speakChunk → utterance.onstart
-                startSpeech();
+                //
+                // iOS cancel()→speak() race: speaking synchronously right after the
+                // cancel() above drops the utterance. Defer one macrotask so WebKit
+                // flushes the cancel first. Speech is already unlocked (we were paused),
+                // so the deferred speak() is still permitted.
+                clearTimeout(appState.voiceStartTimeout);
+                appState.voiceStartTimeout = setTimeout(() => {
+                    appState.voiceStartTimeout = null;
+                    startSpeech();
+                }, 260);
             } else {
                 window.speechSynthesis.resume();
                 appState.playbackState = 'speaking';
@@ -1615,7 +1677,8 @@
                     }
                 }
 
-                if (!target) return;
+                // A tap on empty space (no word) dismisses any open popover.
+                if (!target) { hideWordPopover(); return; }
 
                 // Suppress the 300 ms synthetic click that iOS would fire next,
                 // and stop propagation so the document-level epub handler doesn't
@@ -1623,12 +1686,9 @@
                 e.preventDefault();
                 e.stopPropagation();
 
-                const start = parseInt(target.dataset.start, 10);
-                if (!isNaN(start)) {
-                    cancelCurrentSpeech();
-                    appState.globalCharIndex = start;
-                    startSpeech();
-                }
+                // New UX: do NOT start speech here. Anchor the "Start from here"
+                // popover to the word; speech begins from the popover's own tap.
+                showPopoverForSpan(target, ownerDoc);
             }, { passive: false }); // passive: false is required to call preventDefault
 
             // Desktop / mouse / stylus fallback.
@@ -1637,15 +1697,141 @@
                 // Guard: e.target may be a text node on some desktop browsers too
                 const el = e.target;
                 const target = (el && el.closest) ? el.closest('.wf-speech-word') : null;
-                if (!target) return;
-                const start = parseInt(target.dataset.start, 10);
-                if (!isNaN(start)) {
-                    cancelCurrentSpeech();
-                    appState.globalCharIndex = start;
-                    startSpeech();
-                }
+                if (!target) { hideWordPopover(); return; }
+                showPopoverForSpan(target, ownerDoc);
             });
         }
+
+        // ── Floating "Start from here" Popover ────────────────────────────────
+        //
+        // New UX (ElevenLabs-style): tapping a word no longer starts playback
+        // immediately. Instead we surface a small floating button anchored to the
+        // tapped word. Pressing it starts TTS from that word; tapping anywhere else
+        // dismisses it. Identical behaviour for the rendered plain-text view and
+        // the cross-document EPUB iframe view.
+        //
+        // Starting speech from the popover BUTTON's own tap (rather than from the
+        // word tap) gives us a clean, dedicated user gesture — which is what iOS
+        // Safari requires to unlock speechSynthesis — and lets us route through
+        // beginPlaybackFromIndex(), which side-steps the iOS cancel()→speak() race.
+
+        /**
+         * getSpanRectInMainViewport — returns the tapped word's bounding rect in
+         * MAIN-document viewport coordinates. EPUB word spans live inside an iframe,
+         * so their getBoundingClientRect() is relative to the iframe's own viewport;
+         * we translate that by adding the <iframe> element's offset in the main doc.
+         */
+        function getSpanRectInMainViewport(span, ownerDoc) {
+            const r = span.getBoundingClientRect();
+            if (ownerDoc && ownerDoc !== document &&
+                ownerDoc.defaultView && ownerDoc.defaultView.frameElement) {
+                const fr = ownerDoc.defaultView.frameElement.getBoundingClientRect();
+                return {
+                    left:  fr.left + r.left,  top:    fr.top + r.top,
+                    right: fr.left + r.right, bottom: fr.top + r.bottom,
+                    width: r.width,           height: r.height
+                };
+            }
+            return { left: r.left, top: r.top, right: r.right, bottom: r.bottom,
+                     width: r.width, height: r.height };
+        }
+
+        /** showPopoverForSpan — anchor the popover above (or below) a tapped word. */
+        function showPopoverForSpan(span, ownerDoc) {
+            const start = parseInt(span.dataset.start, 10);
+            if (isNaN(start)) return;
+            appState.pendingStartIndex = start;
+
+            const rect = getSpanRectInMainViewport(span, ownerDoc);
+            const pop  = dom.wordPopover;
+
+            pop.classList.remove('hidden'); // make it measurable (first show only)
+
+            const pw = pop.offsetWidth  || 150;
+            const ph = pop.offsetHeight || 40;
+
+            let left = rect.left + rect.width / 2 - pw / 2;
+            let top  = rect.top - ph - 10;           // prefer floating above the word
+            if (top < 8) top = rect.bottom + 10;     // no room above → place below
+
+            const margin = 8;
+            left = Math.max(margin, Math.min(left, window.innerWidth  - pw - margin));
+            top  = Math.max(margin, Math.min(top,  window.innerHeight - ph - margin));
+
+            pop.style.left = left + 'px';
+            pop.style.top  = top  + 'px';
+            // rAF so the scale/opacity transition plays even on the first show
+            requestAnimationFrame(() => pop.classList.add('visible'));
+        }
+
+        /** hideWordPopover — dismiss the popover and forget the pending position. */
+        function hideWordPopover() {
+            appState.pendingStartIndex = null;
+            dom.wordPopover.classList.remove('visible');
+        }
+
+        /**
+         * beginPlaybackFromIndex — cancel any current speech and (re)start from an
+         * absolute character index.
+         *
+         * iOS WebKit bug worked around here: speechSynthesis.cancel() followed by
+         * speechSynthesis.speak() in the SAME synchronous turn causes WebKit to
+         * discard the freshly-queued utterance — playback stops and never restarts.
+         * (This was the original reason tapping a word "did nothing" on iOS: the tap
+         * cancelled the live utterance and the immediate restart was dropped.)
+         *
+         * Fix: when we are interrupting speech that is already active/paused we defer
+         * the restart to a later macrotask so the cancel can flush. Speech is already
+         * unlocked in that case, so the deferred speak() is still permitted. Starting
+         * from idle happens synchronously inside the caller's gesture — no cancel to
+         * race against, and the gesture unlocks iOS speech the first time.
+         */
+        function beginPlaybackFromIndex(index) {
+            const wasActive = (appState.playbackState === 'speaking' ||
+                               appState.playbackState === 'paused'   ||
+                               appState.playbackState === 'starting');
+
+            cancelCurrentSpeech();
+            appState.globalCharIndex = index;
+
+            if (wasActive && isIOS) {
+                setStatus('Starting…');
+                clearTimeout(appState.voiceStartTimeout);
+                appState.voiceStartTimeout = setTimeout(() => {
+                    appState.voiceStartTimeout = null;
+                    startSpeech();
+                }, 260);
+            } else {
+                startSpeech();
+            }
+        }
+
+        /**
+         * activateWordPopover — the dedicated user gesture that actually starts
+         * speech. Handles both touchend (iOS) and click (desktop); a guard would be
+         * redundant because preventDefault() on touchend suppresses the synthetic
+         * click, but we null the pending index on hide so a stray second call no-ops.
+         */
+        function activateWordPopover(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            const idx = appState.pendingStartIndex;
+            hideWordPopover();
+            if (idx !== null && idx !== undefined && !isNaN(idx)) {
+                beginPlaybackFromIndex(idx);
+            }
+        }
+        dom.wordPopover.addEventListener('touchend', activateWordPopover, { passive: false });
+        dom.wordPopover.addEventListener('click',    activateWordPopover);
+
+        // Any tap in the MAIN document outside the popover dismisses it. Taps inside
+        // the EPUB iframe don't bubble here — those are handled by the iframe's own
+        // listeners, which re-show the popover on a word or hide it on empty space.
+        document.addEventListener('pointerdown', (e) => {
+            if (!dom.wordPopover.classList.contains('visible')) return;
+            if (dom.wordPopover.contains(e.target)) return;
+            hideWordPopover();
+        }, true);
 
         // ── Rendering & Highlighting ──────────────────────────────────────────
 
@@ -1710,6 +1896,7 @@
             const contents = appState.epubRendition.getContents()[0];
             if (!contents || !contents.document) return;
 
+            hideWordPopover(); // the page changed — any anchored popover is now stale
             cancelCurrentSpeech();
             appState.globalCharIndex = 0;
 
@@ -1857,26 +2044,18 @@
                     // Use the touch lift-point, not the (potentially stale) e.target
                     const touch  = e.changedTouches[0];
                     const target = wordSpanAtCoords(touch.clientX, touch.clientY);
-                    if (!target) return;
+                    // Tap on empty space inside the iframe dismisses the popover.
+                    if (!target) { hideWordPopover(); return; }
                     e.preventDefault();
-                    const start = parseInt(target.dataset.start, 10);
-                    if (!isNaN(start)) {
-                        cancelCurrentSpeech();
-                        appState.globalCharIndex = start;
-                        startSpeech();
-                    }
+                    // New UX: reveal the "Start from here" popover; speech starts from it.
+                    showPopoverForSpan(target, doc);
                 }, { passive: false });
 
                 // Mouse / stylus fallback for the iframe document (desktop EPUB reading)
                 doc.addEventListener('click', (e) => {
                     const target = wordSpanAtCoords(e.clientX, e.clientY);
-                    if (!target) return;
-                    const start = parseInt(target.dataset.start, 10);
-                    if (!isNaN(start)) {
-                        cancelCurrentSpeech();
-                        appState.globalCharIndex = start;
-                        startSpeech();
-                    }
+                    if (!target) { hideWordPopover(); return; }
+                    showPopoverForSpan(target, doc);
                 });
             }
 
@@ -1927,6 +2106,7 @@
         let activeSheet = null;
 
         function openSheet(sheet) {
+            hideWordPopover(); // a stale popover would float over the sheet
             if (activeSheet && activeSheet !== sheet) {
                 activeSheet.classList.remove('open');
             }
@@ -2000,6 +2180,7 @@
 
         // Playback
         dom.speakBtn.addEventListener('click', () => {
+            hideWordPopover();
             // Cancel any in-flight speech (e.g. clicked while paused — globalCharIndex preserved)
             cancelCurrentSpeech();
             if (!appState.isEpubActive && dom.plainTextMode.value.trim() !== '') {
@@ -2011,7 +2192,12 @@
         dom.pauseBtn.addEventListener('click', pauseSpeech);
         dom.resumeBtn.addEventListener('click', resumeSpeech);
 
+        // Scrolling the rendered text moves the words out from under a fixed-position
+        // popover, so dismiss it. (EPUB page turns are handled via 'relocated'.)
+        dom.renderedTextMode.addEventListener('scroll', hideWordPopover, { passive: true });
+
         dom.stopBtn.addEventListener('click', () => {
+            hideWordPopover();
             stopSpeech();
             if (!appState.isEpubActive) {
                 dom.plainTextMode.style.display    = 'block';
