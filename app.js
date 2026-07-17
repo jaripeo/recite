@@ -1064,6 +1064,43 @@ function syncVisibleEpubText() {
     requestAnimationFrame(() => {
 
         // ── Phase 1: Off-screen clone ─────────────────────────────────────
+        // Phase 0: Pre-swap visibility measurement.
+        // Measure which character range is visible NOW, before touching the DOM.
+        // epub.js's scroll/transform state is correct at this point. Parent-element
+        // bounding rects serve as proxies for text node positions: if wf-speech-word
+        // spans exist from a prior pass they give word-level granularity; otherwise
+        // block elements give page-level granularity — both are measured before any
+        // body swap, so they're always accurate.
+        const iw = (doc.defaultView && doc.defaultView.innerWidth)  || body.clientWidth  || 0;
+        const ih = (doc.defaultView && doc.defaultView.innerHeight) || body.clientHeight || 0;
+        const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG']);
+
+        const walkerPre = doc.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+        const preNodes  = [];
+        let preText     = '';
+        let wn;
+        while ((wn = walkerPre.nextNode()) !== null) {
+            let el = wn.parentElement, skip = false;
+            while (el) {
+                if (SKIP_TAGS.has(el.tagName && el.tagName.toUpperCase())) { skip = true; break; }
+                el = el.parentElement;
+            }
+            if (skip) continue;
+            preNodes.push({ start: preText.length, end: preText.length + wn.textContent.length, parentEl: wn.parentElement });
+            preText += wn.textContent;
+        }
+        const preRects = preNodes.map(d => d.parentEl ? d.parentEl.getBoundingClientRect() : null);
+        let preVisStart = -1, preVisEnd = -1;
+        preRects.forEach((rect, i) => {
+            if (!rect || (rect.width === 0 && rect.height === 0)) return;
+            const cx = (rect.left + rect.right) / 2;
+            const cy = (rect.top  + rect.bottom) / 2;
+            if (cx >= 0 && cx < iw && cy >= 0 && cy < ih) {
+                if (preVisStart === -1) preVisStart = preNodes[i].start;
+                preVisEnd = preNodes[i].end;
+            }
+        });
+
         const clone = body.cloneNode(true);
 
         // ── Phase 2: Unwrap existing spans in the clone ───────────────────
@@ -1073,7 +1110,6 @@ function syncVisibleEpubText() {
         clone.normalize();
 
         // ── Phase 3: Collect text nodes via native TreeWalker ─────────────
-        const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG']);
         const walker    = doc.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
         const textNodes = [];
         let walkerNode;
@@ -1123,81 +1159,33 @@ function syncVisibleEpubText() {
             parent.replaceChild(fragment, textNode);
         });
 
-        // ── Phase 5: Save scroll, atomic swap, restore scroll ─────────────
-        // epub.js uses scrollTo() for CSS-column pagination. Some WebKit builds
-        // reset scrollX to 0 when body children are replaced. We save and
-        // restore so Phase 6's getBoundingClientRect() returns correct
-        // viewport-relative coordinates for the actual visible column.
-        const savedScrollX = doc.defaultView ? Math.round(doc.defaultView.scrollX) : 0;
+        // Phase 5: Atomic swap into the live body.
         const tempFrag = doc.createDocumentFragment();
         while (clone.firstChild) tempFrag.appendChild(clone.firstChild);
         body.textContent = '';
         body.appendChild(tempFrag);
-        if (savedScrollX > 0 && doc.defaultView) {
-            doc.defaultView.scrollTo(savedScrollX, 0);
-        }
         // Span refs in wordMap are now live in body (nodes were moved, not copied).
 
-        // ── Phase 6: Viewport-visibility filter ───────────────────────────
-        //
-        // epub.js paginated layout: the visible "page" occupies the iframe
-        // viewport rectangle [0, 0, innerWidth, innerHeight]. Spans in the
-        // next/previous column have rect.left ≥ innerWidth or rect.left < 0.
-        //
-        // We batch all getBoundingClientRect() reads in one pass (one layout
-        // recalculation, then all answers returned from cache) then process
-        // the results without any further DOM reads — avoiding extra reflows.
-        //
-        // Center-based horizontal test: robust against sub-pixel overflow at
-        // column boundaries where a word's box might straddle the edge.
-        const iw = (doc.defaultView && doc.defaultView.innerWidth)  || body.clientWidth  || Infinity;
-        const ih = (doc.defaultView && doc.defaultView.innerHeight) || body.clientHeight || Infinity;
-
-        // Single batched read — forces one layout pass, then the browser
-        // answers all subsequent rect queries from its cached layout state.
-        const rects = wordMap.map(entry => entry.span.getBoundingClientRect());
-
-        let firstVis = -1;
-        let lastVis  = -1;
-
-        rects.forEach((rect, i) => {
-            // Skip zero-area rects (hidden elements, collapsed inline nodes)
-            if (rect.width === 0 && rect.height === 0) return;
-            const cx = (rect.left + rect.right)  / 2;
-            const cy = (rect.top  + rect.bottom) / 2;
-            if (cx >= 0 && cx < iw && cy >= 0 && cy < ih) {
-                if (firstVis === -1) firstVis = i;
-                lastVis = i;
-            }
-        });
-
-        // Fallback: if the scroll restore didn't take effect (some WebKit builds
-        // ignore synchronous scrollTo() during rAF), use layout-position math.
-        if (firstVis === -1 && savedScrollX > 0 && wordMap.length > 0) {
-            rects.forEach((rect, i) => {
-                if (rect.width === 0 && rect.height === 0) return;
-                const layoutX = rect.left + savedScrollX;
-                if (layoutX >= savedScrollX && layoutX < savedScrollX + iw) {
+        // Phase 6: Map pre-measured visible range to rebuilt wordMap.
+        // fullText and preText were built from the same text nodes in the same
+        // traversal order, so character positions correspond 1:1 between them.
+        // Using the pre-swap range avoids any scroll/transform state issues that
+        // occur after the body swap.
+        let firstVis = -1, lastVis = -1;
+        if (preVisStart >= 0 && preVisEnd > preVisStart) {
+            for (let i = 0; i < wordMap.length; i++) {
+                if (wordMap[i].end > preVisStart && wordMap[i].start < preVisEnd) {
                     if (firstVis === -1) firstVis = i;
                     lastVis = i;
                 }
-            });
+            }
         }
+        // Fallback if pre-swap measurement found nothing (iw/ih = 0 or all
+        // rects zero-area): use full text so TTS still functions.
 
-        // Build the visible-page subset of fullText and wordMap.
-        // visCharStart/End define the character range of the visible page
-        // within the full chapter text string.
-        const visCharStart = firstVis >= 0 ? wordMap[firstVis].start : 0;
-        const visCharEnd   = lastVis  >= 0 ? wordMap[lastVis].end   : fullText.length;
-
-        // Visible text is the exact substring: first-visible-word to
-        // last-visible-word, preserving all inter-word whitespace.
-        const visibleText = fullText.substring(visCharStart, visCharEnd);
-
-        // Remap each visible span's data-start/data-end to be 0-relative
-        // within visibleText. This keeps onboundary charIndex arithmetic
-        // correct and ensures the "Start from here" popover passes a valid
-        // index into the text that TTS will actually read.
+        const visCharStart  = firstVis >= 0 ? wordMap[firstVis].start : 0;
+        const visCharEnd    = lastVis  >= 0 ? wordMap[lastVis].end   : fullText.length;
+        const visibleText   = fullText.substring(visCharStart, visCharEnd);
         const visibleWordMap = [];
         if (firstVis >= 0) {
             for (let i = firstVis; i <= lastVis; i++) {
@@ -1209,11 +1197,6 @@ function syncVisibleEpubText() {
                 visibleWordMap.push({ span: entry.span, start: newStart, end: newEnd });
             }
         }
-
-        // Commit: TTS and highlighting now operate exclusively on the
-        // visible page. Off-screen spans remain in the DOM untouched
-        // (epub.js needs them for column layout) but are unreachable
-        // by any TTS or highlight code path.
         appState.wordMap  = visibleWordMap;
         appState.fullText = visibleText;
 
