@@ -223,6 +223,19 @@
         #nextBtn { right: 6px; }
         .epub-nav:active { background: rgba(0, 122, 255, 0.12); }
 
+        /* ── EPUB tap-capture overlay ────────────────────────────────────────── */
+        /* Sits OVER the epub.js iframe in the parent document so iOS touch events
+           never have to cross the iframe boundary (where epub.js intercepts them).
+           z-index: 6 keeps it below the epub nav buttons at z-index: 10.        */
+        #epubTapOverlay {
+            display: none;
+            position: absolute;
+            inset: 0;
+            z-index: 6;
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
+        }
+
         /* ── Bottom Bar ──────────────────────────────────────────────────────── */
         #bottomBar {
             flex-shrink: 0;
@@ -680,6 +693,10 @@
         <div id="renderedTextMode"></div>
         <div id="epubMode"></div>
 
+        <!-- Transparent overlay in the parent document — catches all EPUB taps
+             before epub.js's iframe handlers can intercept them on iOS. -->
+        <div id="epubTapOverlay"></div>
+
         <button id="prevBtn" class="epub-nav hidden" aria-label="Previous page">❮</button>
         <button id="nextBtn" class="epub-nav hidden" aria-label="Next page">❯</button>
     </main>
@@ -877,7 +894,9 @@
             // Overlay
             sheetOverlay:       document.getElementById('sheetOverlay'),
             // Floating "Start from here" popover
-            wordPopover:        document.getElementById('wordPopover')
+            wordPopover:        document.getElementById('wordPopover'),
+            // Transparent EPUB tap-capture overlay (parent-document, above iframe)
+            epubTapOverlay:     document.getElementById('epubTapOverlay')
         };
 
         // ── Central State ─────────────────────────────────────────────────────
@@ -1423,6 +1442,7 @@
                     dom.plainTextMode.style.display    = 'none';
                     dom.renderedTextMode.style.display = 'none';
                     dom.epubMode.style.display         = 'block';
+                    dom.epubTapOverlay.style.display   = 'none'; // hide during load; shown on display()
                     appState.isEpubActive = true;
 
                     if (appState.epubBook) appState.epubBook.destroy();
@@ -1454,6 +1474,8 @@
                         clearTimeout(renderTimeout);
                         dom.prevBtn.classList.remove('hidden');
                         dom.nextBtn.classList.remove('hidden');
+                        // Show the parent-document overlay that captures EPUB taps on iOS
+                        dom.epubTapOverlay.style.display = 'block';
                         setStatus("EPUB loaded — tap a word or press Play");
                         resolve();
                     }).catch(reject);
@@ -1468,7 +1490,8 @@
         async function loadEpubWithJSZipFallback(arrayBuffer) {
             try {
                 appState.isEpubActive = false;
-                dom.epubMode.style.display = 'none';
+                dom.epubMode.style.display         = 'none';
+                dom.epubTapOverlay.style.display   = 'none'; // no iframe in fallback mode
                 dom.prevBtn.classList.add('hidden');
                 dom.nextBtn.classList.add('hidden');
 
@@ -1723,14 +1746,28 @@
          */
         function getSpanRectInMainViewport(span, ownerDoc) {
             const r = span.getBoundingClientRect();
-            if (ownerDoc && ownerDoc !== document &&
-                ownerDoc.defaultView && ownerDoc.defaultView.frameElement) {
-                const fr = ownerDoc.defaultView.frameElement.getBoundingClientRect();
-                return {
-                    left:  fr.left + r.left,  top:    fr.top + r.top,
-                    right: fr.left + r.right, bottom: fr.top + r.bottom,
-                    width: r.width,           height: r.height
-                };
+            if (ownerDoc && ownerDoc !== document) {
+                // Attempt 1: frameElement on the iframe's own window (works for
+                // same-origin iframes that are NOT sandboxed).
+                let frameEl = null;
+                try {
+                    if (ownerDoc.defaultView) frameEl = ownerDoc.defaultView.frameElement;
+                } catch (_) {}
+
+                // Attempt 2: epub.js sandboxes its iframe, making frameElement null
+                // from inside the iframe's context. Query the parent DOM directly.
+                if (!frameEl && appState.isEpubActive) {
+                    frameEl = dom.epubMode.querySelector('iframe');
+                }
+
+                if (frameEl) {
+                    const fr = frameEl.getBoundingClientRect();
+                    return {
+                        left:   fr.left + r.left,  top:    fr.top + r.top,
+                        right:  fr.left + r.right, bottom: fr.top + r.bottom,
+                        width:  r.width,           height: r.height
+                    };
+                }
             }
             return { left: r.left, top: r.top, right: r.right, bottom: r.bottom,
                      width: r.width, height: r.height };
@@ -1832,6 +1869,112 @@
             if (dom.wordPopover.contains(e.target)) return;
             hideWordPopover();
         }, true);
+
+        // ── EPUB Tap Overlay Setup ────────────────────────────────────────────
+        //
+        // This is the PRIMARY touch handler for EPUB word taps on iOS.
+        //
+        // Why: epub.js installs gesture listeners on the iframe's window in the
+        // capture phase, consuming touchstart/touchend before our delegated handlers
+        // on the iframe body/document ever see them. Fighting inside the iframe is
+        // unreliable. Instead we place a transparent div (#epubTapOverlay) in the
+        // PARENT document, directly above the iframe (z-index 6; nav buttons are 10).
+        // Touches on the overlay fire in the parent-document context — completely
+        // outside epub.js's reach. We translate the parent-viewport coordinates to
+        // the iframe's viewport coordinate space and use elementFromPoint /
+        // caretRangeFromPoint on the iframe's document to find the word span.
+        //
+        // The overlay is shown/hidden when entering/leaving EPUB mode.
+        //
+        (function setupEpubTapOverlay() {
+            let oTouchStartX = 0, oTouchStartY = 0, oTouchMoved = false;
+
+            dom.epubTapOverlay.addEventListener('touchstart', (e) => {
+                oTouchStartX = e.touches[0].clientX;
+                oTouchStartY = e.touches[0].clientY;
+                oTouchMoved  = false;
+            }, { passive: true });
+
+            dom.epubTapOverlay.addEventListener('touchmove', (e) => {
+                if (Math.abs(e.touches[0].clientX - oTouchStartX) > 6 ||
+                    Math.abs(e.touches[0].clientY - oTouchStartY) > 6) {
+                    oTouchMoved = true;
+                }
+            }, { passive: true });
+
+            dom.epubTapOverlay.addEventListener('touchend', (e) => {
+                if (oTouchMoved) { hideWordPopover(); return; }
+
+                // Suppress the 300 ms synthetic click so it doesn't also trigger
+                // the overlay's click handler below.
+                e.preventDefault();
+
+                if (!appState.isEpubActive) return;
+
+                const touch   = e.changedTouches[0];
+
+                // epub.js creates one iframe per rendition (paginated mode reuses it
+                // across page turns). querySelector is called fresh each touchend so
+                // we always get the current iframe even if epub.js rebuilt it.
+                const iframe  = dom.epubMode.querySelector('iframe');
+                if (!iframe) { hideWordPopover(); return; }
+
+                const iframeDoc = iframe.contentDocument;
+                if (!iframeDoc) { hideWordPopover(); return; }
+
+                // Translate parent-viewport coords → iframe-internal coords.
+                // getBoundingClientRect() on the iframe element is always in the
+                // parent document's viewport space regardless of epub.js transforms.
+                const fr  = iframe.getBoundingClientRect();
+                const iX  = touch.clientX - fr.left;
+                const iY  = touch.clientY - fr.top;
+
+                // Strategy 1: elementFromPoint respects CSS transforms, so it
+                // correctly resolves the visible column in paginated-column layouts.
+                let el = iframeDoc.elementFromPoint(iX, iY);
+                let wordSpan = el ? el.closest('.wf-speech-word') : null;
+
+                // Strategy 2: caretRangeFromPoint catches sub-pixel gaps between
+                // glyphs where elementFromPoint falls through to the body.
+                if (!wordSpan && iframeDoc.caretRangeFromPoint) {
+                    const range = iframeDoc.caretRangeFromPoint(iX, iY);
+                    if (range) {
+                        const node = range.startContainer;
+                        el = (node.nodeType === Node.TEXT_NODE) ? node.parentElement : node;
+                        wordSpan = el ? el.closest('.wf-speech-word') : null;
+                    }
+                }
+
+                if (wordSpan) {
+                    showPopoverForSpan(wordSpan, iframeDoc);
+                } else {
+                    hideWordPopover();
+                }
+            }, { passive: false });
+
+            // Desktop / pointer-device fallback.
+            // On iOS the touchend handler calls e.preventDefault() which suppresses
+            // this synthetic click, so there is no double-fire on mobile.
+            dom.epubTapOverlay.addEventListener('click', (e) => {
+                if (!appState.isEpubActive) return;
+
+                const iframe = dom.epubMode.querySelector('iframe');
+                if (!iframe) return;
+
+                const iframeDoc = iframe.contentDocument;
+                if (!iframeDoc) return;
+
+                const fr = iframe.getBoundingClientRect();
+                const el = iframeDoc.elementFromPoint(e.clientX - fr.left, e.clientY - fr.top);
+                const wordSpan = el ? el.closest('.wf-speech-word') : null;
+
+                if (wordSpan) {
+                    showPopoverForSpan(wordSpan, iframeDoc);
+                } else {
+                    hideWordPopover();
+                }
+            });
+        })();
 
         // ── Rendering & Highlighting ──────────────────────────────────────────
 
