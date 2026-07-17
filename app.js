@@ -115,7 +115,8 @@ const appState = {
     playbackChunks:    [],
     currentChunkIndex: 0,
     voiceStartTimeout: null,
-    pendingStartIndex: null
+    pendingStartIndex: null,
+    autoResumeAfterPageTurn: false
 };
 
 // ── Storage Helpers ───────────────────────────────────────────────────────────
@@ -725,8 +726,16 @@ function buildToc(tocArray) {
     }
 }
 
-dom.prevBtn.addEventListener('click', () => { if (appState.epubRendition) appState.epubRendition.prev(); });
-dom.nextBtn.addEventListener('click', () => { if (appState.epubRendition) appState.epubRendition.next(); });
+dom.prevBtn.addEventListener('click', () => {
+    if (!appState.epubRendition) return;
+    if (appState.playbackState === 'speaking') appState.autoResumeAfterPageTurn = true;
+    appState.epubRendition.prev();
+});
+dom.nextBtn.addEventListener('click', () => {
+    if (!appState.epubRendition) return;
+    if (appState.playbackState === 'speaking') appState.autoResumeAfterPageTurn = true;
+    appState.epubRendition.next();
+});
 
 // ── Text Stats & Progress ─────────────────────────────────────────────────────
 
@@ -1035,6 +1044,11 @@ function syncVisibleEpubText() {
     if (!contents || !contents.document) return;
 
     hideWordPopover();
+
+    // Capture auto-resume intent BEFORE cancelCurrentSpeech() resets playback state
+    const shouldAutoResume = appState.autoResumeAfterPageTurn;
+    appState.autoResumeAfterPageTurn = false;
+
     cancelCurrentSpeech();   // safe on idle engine; clears any stale highlights
     appState.globalCharIndex = 0;
     setStatus("Loading page…");
@@ -1109,11 +1123,19 @@ function syncVisibleEpubText() {
             parent.replaceChild(fragment, textNode);
         });
 
-        // ── Phase 5: Single atomic swap into the live body ────────────────
+        // ── Phase 5: Save scroll, atomic swap, restore scroll ─────────────
+        // epub.js uses scrollTo() for CSS-column pagination. Some WebKit builds
+        // reset scrollX to 0 when body children are replaced. We save and
+        // restore so Phase 6's getBoundingClientRect() returns correct
+        // viewport-relative coordinates for the actual visible column.
+        const savedScrollX = doc.defaultView ? Math.round(doc.defaultView.scrollX) : 0;
         const tempFrag = doc.createDocumentFragment();
         while (clone.firstChild) tempFrag.appendChild(clone.firstChild);
         body.textContent = '';
         body.appendChild(tempFrag);
+        if (savedScrollX > 0 && doc.defaultView) {
+            doc.defaultView.scrollTo(savedScrollX, 0);
+        }
         // Span refs in wordMap are now live in body (nodes were moved, not copied).
 
         // ── Phase 6: Viewport-visibility filter ───────────────────────────
@@ -1148,6 +1170,19 @@ function syncVisibleEpubText() {
                 lastVis = i;
             }
         });
+
+        // Fallback: if the scroll restore didn't take effect (some WebKit builds
+        // ignore synchronous scrollTo() during rAF), use layout-position math.
+        if (firstVis === -1 && savedScrollX > 0 && wordMap.length > 0) {
+            rects.forEach((rect, i) => {
+                if (rect.width === 0 && rect.height === 0) return;
+                const layoutX = rect.left + savedScrollX;
+                if (layoutX >= savedScrollX && layoutX < savedScrollX + iw) {
+                    if (firstVis === -1) firstVis = i;
+                    lastVis = i;
+                }
+            });
+        }
 
         // Build the visible-page subset of fullText and wordMap.
         // visCharStart/End define the character range of the visible page
@@ -1256,7 +1291,26 @@ function syncVisibleEpubText() {
         updateStats();
         updateProgress();
         updatePlaybackUI();
-        setStatus("EPUB page ready — tap a word or press Play");
+
+        // Auto-resume: if the user clicked Next/Prev while TTS was speaking,
+        // restart from the top of the newly-loaded page.
+        if (shouldAutoResume && appState.fullText) {
+            setStatus("Continuing…");
+            appState.globalCharIndex = 0;
+            clearTimeout(appState.voiceStartTimeout);
+            if (isIOS) {
+                // iOS WebKit: cancel() + speak() in the same tick silently drops
+                // the utterance. Defer past the engine's cancel propagation.
+                appState.voiceStartTimeout = setTimeout(() => {
+                    appState.voiceStartTimeout = null;
+                    startSpeech();
+                }, 260);
+            } else {
+                startSpeech();
+            }
+        } else {
+            setStatus("EPUB page ready — tap a word or press Play");
+        }
     });
 }
 
@@ -1365,10 +1419,22 @@ dom.playToggleBtn.addEventListener('click', () => {
     if (!appState.isEpubActive && dom.plainTextMode.value.trim() !== '') {
         renderPlainTextForReading();
     }
-    // In EPUB mode globalCharIndex is always 0 after a page turn, so Play
-    // naturally starts from the top of the current visible page.
-    const idx = (appState.pendingStartIndex !== null) ? appState.pendingStartIndex : appState.globalCharIndex;
-    appState.pendingStartIndex = null;
+
+    let idx;
+    if (appState.pendingStartIndex !== null) {
+        // User tapped a word via "Start from here" popover
+        idx = appState.pendingStartIndex;
+        appState.pendingStartIndex = null;
+    } else if (appState.isEpubActive && appState.wordMap.length > 0) {
+        // EPUB: always start from the first visible word on the current page.
+        // wordMap[0].start === 0 after Phase 6 remapping, so this is explicit
+        // rather than relying on globalCharIndex being correct.
+        idx = appState.wordMap[0].start;
+        appState.globalCharIndex = idx;
+    } else {
+        idx = appState.globalCharIndex;
+    }
+
     beginPlaybackFromIndex(idx);
 });
 
