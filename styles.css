@@ -1,0 +1,543 @@
+/* ── Design tokens ───────────────────────────────────────────────────── */
+:root {
+    --bg:              #f2f2f7;
+    --surface:         #ffffff;
+    --surface2:        #f2f2f7;
+    --accent:          #007AFF;
+    --accent-dark:     #0055cc;
+    --red:             #ff3b30;
+    --green:           #34c759;
+    --orange:          #ff9500;
+    --text:            #000000;
+    --text2:           rgba(60, 60, 67, 0.60);
+    --separator:       rgba(60, 60, 67, 0.18);
+    --highlight-word:  #ffeb3b;
+    --highlight-sent:  #e3f2fd;
+    /* Safe area insets — resolved at runtime by the browser */
+    --sat: env(safe-area-inset-top,    0px);
+    --sar: env(safe-area-inset-right,  0px);
+    --sab: env(safe-area-inset-bottom, 0px);
+    --sal: env(safe-area-inset-left,   0px);
+    --top-bar-h:    52px;
+    --bottom-bar-h: 108px;
+}
+
+/* ── Reset ───────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0; padding: 0;
+    /* Eliminate 300 ms click delay on every element */
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+}
+
+html {
+    /* Prevent elastic overscroll on the root */
+    overscroll-behavior: none;
+    height: 100%;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    /* 100dvh tracks the VISUAL viewport (shrinks when iOS keyboard appears) */
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    /* Prevent pull-to-refresh gesture in standalone mode */
+    overscroll-behavior-y: none;
+}
+
+/* ── Top Bar ─────────────────────────────────────────────────────────── */
+#topBar {
+    flex-shrink: 0;
+    /* Height grows to accommodate the status-bar safe area */
+    height: calc(var(--top-bar-h) + var(--sat));
+    padding-top: var(--sat);
+    padding-left: calc(4px + var(--sal));
+    padding-right: calc(4px + var(--sar));
+    background: rgba(255, 255, 255, 0.88);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    border-bottom: 0.5px solid var(--separator);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    position: relative;
+    z-index: 400;
+}
+
+.app-title {
+    flex: 1;
+    text-align: center;
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: -0.4px;
+    pointer-events: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#statusMessage {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--accent);
+    max-width: 100px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: right;
+    transition: color 0.2s ease;
+}
+
+#statusMessage[data-state="speaking"] { color: var(--green);  }
+#statusMessage[data-state="paused"]   { color: var(--orange); }
+#statusMessage[data-state="starting"] { color: var(--orange); }
+#statusMessage[data-state="idle"]     { color: var(--accent); }
+
+/* ── Icon Buttons (top bar) ──────────────────────────────────────────── */
+.icon-btn {
+    flex-shrink: 0;
+    width: 44px;
+    height: 44px;
+    border: none;
+    background: none;
+    border-radius: 22px;
+    font-size: 20px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--accent);
+}
+
+.icon-btn:active { background: rgba(0, 122, 255, 0.12); }
+.icon-btn.wake-active { color: var(--green); }
+
+/* ── Reader Container ────────────────────────────────────────────────── */
+#readerContainer {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    background: var(--surface);
+    /* Let the content area take min-height so it doesn't collapse */
+    min-height: 0;
+}
+
+/* All three reading-mode panels fill the container absolutely */
+#plainTextMode,
+#renderedTextMode,
+#epubMode {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+#plainTextMode {
+    padding: 16px;
+    /* 16px prevents iOS auto-zoom on focus */
+    font-size: 16px;
+    line-height: 1.6;
+    border: none;
+    outline: none;
+    resize: none;
+    background: var(--surface);
+    color: var(--text);
+    /* Allow normal text selection in edit mode */
+}
+
+#renderedTextMode {
+    display: none;
+    padding: 16px;
+    font-size: 17px;
+    line-height: 1.75;
+    font-family: Georgia, 'New York', 'Times New Roman', serif;
+    color: var(--text);
+    white-space: pre-wrap;
+    /* Block text selection so tapping words is clean */
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+#epubMode {
+    display: none;
+    padding: 0;
+}
+
+/* epub-nav floating buttons removed — navigation is in the footer */
+
+/* ── EPUB tap-capture overlay ────────────────────────────────────────── */
+/* Sits OVER the epub.js iframe in the parent document so iOS touch events
+   never have to cross the iframe boundary (where epub.js intercepts them).
+   z-index: 6 keeps it below the epub nav buttons at z-index: 10.        */
+#epubTapOverlay {
+    display: none;
+    position: absolute;
+    inset: 0;
+    z-index: 6;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+}
+
+/* ── Bottom Bar ──────────────────────────────────────────────────────── */
+#bottomBar {
+    flex-shrink: 0;
+    padding-bottom: var(--sab);
+    padding-left: var(--sal);
+    padding-right: var(--sar);
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    border-top: 0.5px solid var(--separator);
+    z-index: 100;
+}
+
+#progressRow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px 4px;
+}
+
+#readingProgress {
+    flex: 1;
+    height: 4px;
+    appearance: none;
+    -webkit-appearance: none;
+    border: none;
+    border-radius: 2px;
+    background: rgba(60, 60, 67, 0.12);
+    overflow: hidden;
+}
+#readingProgress::-webkit-progress-bar {
+    background: rgba(60, 60, 67, 0.12);
+    border-radius: 2px;
+}
+#readingProgress::-webkit-progress-value {
+    background: var(--accent);
+    border-radius: 2px;
+    transition: width 0.15s ease;
+}
+#readingProgress::-moz-progress-bar {
+    background: var(--accent);
+    border-radius: 2px;
+}
+
+#progressPercentage {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text2);
+    min-width: 34px;
+    text-align: right;
+}
+
+/* ── Playback button row ─────────────────────────────────────────────── */
+#playbackRow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 0 12px 8px;
+}
+
+.play-btn {
+    flex: 1;
+    min-height: 56px;
+    border: none;
+    border-radius: 14px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    padding: 8px 4px;
+    transition: transform 0.1s ease, opacity 0.15s ease;
+    will-change: transform;
+}
+
+.play-btn:active:not(:disabled) { transform: scale(0.92); }
+.play-btn:disabled { opacity: 0.30; cursor: default; }
+
+.btn-icon  { font-size: 21px; line-height: 1; display: block; }
+.btn-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px; line-height: 1; }
+
+/* 4-button footer: Prev | Play-toggle | Next | Settings */
+#prevBtn, #nextBtn {
+    background: rgba(60, 60, 67, 0.08);
+    color: var(--text);
+}
+
+#playToggleBtn {
+    flex: 1.5;
+    background: var(--accent);
+    color: #fff;
+}
+#playToggleBtn.is-speaking { background: rgba(255, 149, 0, 0.14); color: var(--orange); }
+#playToggleBtn.is-paused   { background: rgba(52, 199, 89,  0.13); color: var(--green);  }
+
+#settingsToggleBtn {
+    background: rgba(60, 60, 67, 0.08);
+    color: var(--text2);
+}
+
+/* ── Bottom Sheets ───────────────────────────────────────────────────── */
+.bottom-sheet {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--surface);
+    border-radius: 20px 20px 0 0;
+    z-index: 300;
+    max-height: 82dvh;
+    display: flex;
+    flex-direction: column;
+    /* Start off-screen */
+    transform: translateY(100%);
+    transition: transform 0.36s cubic-bezier(0.32, 0.72, 0, 1);
+    will-change: transform;
+    /* Bottom safe area padding so content doesn't hide under home indicator */
+    padding-bottom: var(--sab);
+    box-shadow: 0 -2px 40px rgba(0,0,0,0.18);
+}
+
+.bottom-sheet.open { transform: translateY(0); }
+
+.sheet-handle-row {
+    flex-shrink: 0;
+    display: flex;
+    justify-content: center;
+    padding: 10px 0 0;
+    cursor: grab;
+    /* Allow drag-to-dismiss without triggering the word-tap handler */
+    touch-action: pan-y;
+}
+.sheet-handle {
+    width: 36px;
+    height: 5px;
+    border-radius: 3px;
+    background: rgba(60, 60, 67, 0.28);
+}
+
+.sheet-header {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px 6px;
+}
+.sheet-title {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -0.3px;
+}
+.sheet-done-btn {
+    background: rgba(0, 122, 255, 0.10);
+    color: var(--accent);
+    border: none;
+    border-radius: 20px;
+    padding: 7px 16px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+}
+.sheet-done-btn:active { opacity: 0.7; }
+
+.sheet-scroll {
+    flex: 1;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    /* prevent overscroll "rubber-banding" from dismissing the sheet */
+    overscroll-behavior: contain;
+    padding: 4px 16px 16px;
+}
+
+/* ── Sheet form controls ─────────────────────────────────────────────── */
+.sheet-section { margin-bottom: 22px; }
+
+.sheet-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text2);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    margin-bottom: 7px;
+}
+
+/* font-size 16px on selects/inputs prevents iOS auto-zoom on focus */
+.sheet-select {
+    width: 100%;
+    height: 48px;
+    border: 0.5px solid var(--separator);
+    border-radius: 12px;
+    padding: 0 36px 0 14px;
+    font-size: 16px;
+    background: var(--surface2);
+    color: var(--text);
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23999' stroke-width='1.8' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+}
+.sheet-select:focus { outline: none; border-color: var(--accent); }
+
+.speed-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+.speed-row input[type="range"] {
+    flex: 1;
+    height: 44px;
+    padding: 0;
+    border: none;
+    background: none;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+#speedValue {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--accent);
+    min-width: 34px;
+    text-align: right;
+}
+
+/* File open button — styled as a prominent CTA */
+.file-open-label {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    height: 52px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 17px;
+    font-weight: 600;
+    border-radius: 14px;
+    cursor: pointer;
+    letter-spacing: -0.2px;
+}
+.file-open-label:active { opacity: 0.82; }
+
+/* Voice action buttons row */
+.btn-row { display: flex; gap: 10px; }
+.action-btn {
+    flex: 1;
+    height: 44px;
+    border: 0.5px solid var(--separator);
+    border-radius: 12px;
+    font-size: 14px;
+    font-weight: 500;
+    background: var(--surface2);
+    color: var(--text);
+    cursor: pointer;
+}
+.action-btn:active { background: rgba(0,0,0,0.07); }
+
+/* Stats strip inside settings sheet */
+.stats-strip {
+    display: flex;
+    gap: 16px;
+    font-size: 13px;
+    color: var(--text2);
+}
+
+/* ── TOC Items ───────────────────────────────────────────────────────── */
+.toc-item {
+    padding: 13px 0;
+    font-size: 16px;
+    color: var(--accent);
+    border-bottom: 0.5px solid var(--separator);
+    cursor: pointer;
+}
+.toc-item:active { background: rgba(0, 122, 255, 0.06); border-radius: 8px; }
+.toc-item:last-child { border-bottom: none; }
+
+/* ── Sheet overlay (dims the content behind open sheets) ─────────────── */
+#sheetOverlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.40);
+    z-index: 200;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+}
+#sheetOverlay.visible {
+    opacity: 1;
+    pointer-events: all;
+}
+
+/* ── Word Highlighting ───────────────────────────────────────────────── */
+.wf-speech-word {
+    cursor: pointer;
+    border-radius: 3px;
+    /* touch-action: manipulation is inherited from *, but explicit here for clarity */
+    touch-action: manipulation;
+}
+.wf-speech-word:active {
+    background: rgba(0, 122, 255, 0.10);
+}
+.active-word {
+    background-color: var(--highlight-word) !important;
+    font-weight: bold;
+    border-radius: 3px;
+}
+.active-sentence { background-color: var(--highlight-sent); }
+
+/* ── Floating "Start from here" popover ──────────────────────────────── */
+.word-popover {
+    position: fixed;
+    /* Above reader content and page-turn buttons; below open sheets is fine
+       because we dismiss the popover whenever a sheet opens. */
+    z-index: 500;
+    top: 0;
+    left: 0;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 9px 15px;
+    background: var(--accent);
+    color: #fff;
+    border-radius: 22px;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -0.2px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.28);
+    cursor: pointer;
+    white-space: nowrap;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: manipulation;
+    /* Hidden/animated-out state */
+    opacity: 0;
+    transform: scale(0.86);
+    transform-origin: center bottom;
+    transition: opacity 0.14s ease, transform 0.14s cubic-bezier(0.32, 0.72, 0, 1);
+    pointer-events: none;
+}
+.word-popover.visible {
+    opacity: 1;
+    transform: scale(1);
+    pointer-events: auto;
+}
+.word-popover:active { background: var(--accent-dark); }
+.word-popover .wp-icon { font-size: 12px; line-height: 1; }
+
+/* ── Utilities ───────────────────────────────────────────────────────── */
+.hidden    { display: none !important; }
+.sr-only   {
+    position: absolute; width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap;
+}
